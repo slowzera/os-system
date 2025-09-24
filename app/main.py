@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import re
+import unicodedata
 from datetime import date, datetime
 from pathlib import Path
 from typing import List, Optional
@@ -53,7 +55,55 @@ app.add_middleware(
 )
 
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", Path(__file__).resolve().parent / "storage"))
+MAX_PHOTO_SIZE = int(os.getenv("MAX_PHOTO_SIZE", 5 * 1024 * 1024))
+MAX_IMPORT_SIZE = int(os.getenv("MAX_IMPORT_SIZE", 2 * 1024 * 1024))
+ALLOWED_PHOTO_MIME_TYPES = {
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+}
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _sanitize_filename(filename: str) -> str:
+    """Return a filesystem-safe filename."""
+
+    name = Path(filename).name
+    name = unicodedata.normalize("NFKD", name)
+    name = name.encode("ascii", "ignore").decode()
+    name = re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+    return name or "upload"
+
+
+def _read_limited(upload_file: UploadFile, max_bytes: int) -> bytes:
+    upload_file.file.seek(0)
+    data = bytearray()
+    for chunk in iter(lambda: upload_file.file.read(1024 * 1024), b""):
+        data.extend(chunk)
+        if len(data) > max_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail="Arquivo excede o tamanho máximo permitido",
+            )
+    return bytes(data)
+
+
+def _save_upload_file(upload_file: UploadFile, destination: Path, max_bytes: int) -> None:
+    upload_file.file.seek(0)
+    total = 0
+    with destination.open("wb") as buffer:
+        while True:
+            chunk = upload_file.file.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                destination.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=400,
+                    detail="Arquivo excede o tamanho máximo permitido",
+                )
+            buffer.write(chunk)
 
 
 @app.on_event("startup")
@@ -194,7 +244,7 @@ def import_orders(
     if file.content_type not in {"text/csv", "application/vnd.ms-excel"}:
         raise HTTPException(status_code=400, detail="Envie um arquivo CSV")
 
-    orders_data = parse_orders_csv(file.file.read())
+    orders_data = parse_orders_csv(_read_limited(file, MAX_IMPORT_SIZE))
     created_orders: List[ServiceOrder] = []
     for order_payload in orders_data:
         if (
@@ -354,15 +404,16 @@ def upload_photo(
     if not file.filename:
         raise HTTPException(status_code=400, detail="Arquivo inválido")
 
+    if file.content_type not in ALLOWED_PHOTO_MIME_TYPES:
+        raise HTTPException(status_code=400, detail="Tipo de arquivo não suportado")
+
     order_dir = UPLOAD_DIR / f"order_{order_id}"
     order_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    filename = f"{timestamp}_{file.filename.replace(' ', '_')}"
+    filename = f"{timestamp}_{_sanitize_filename(file.filename)}"
     file_path = order_dir / filename
 
-    with file_path.open("wb") as buffer:
-        contents = file.file.read()
-        buffer.write(contents)
+    _save_upload_file(file, file_path, MAX_PHOTO_SIZE)
 
     photo = models.OrderPhoto(order_id=order.id, file_path=str(file_path))
     session.add(photo)
