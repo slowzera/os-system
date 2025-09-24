@@ -98,8 +98,8 @@ class ServiceOrderRead(ServiceOrderBase):
     id: int
     status: ServiceOrderStatus
     created_at: datetime
-    observations: List[ObservationRead] = []
-    photos: List[PhotoRead] = []
+    observations: List[ObservationRead] = Field(default_factory=list)
+    photos: List[PhotoRead] = Field(default_factory=list)
 
     model_config = ConfigDict(from_attributes=True)
 
